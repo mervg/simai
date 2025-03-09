@@ -1,0 +1,74 @@
+# Logging Configuration
+# ---------------------
+# This file configures the advanced logging system with hierarchical overrides.
+# Configuration hierarchy (highest to lowest priority):
+# 1. Context-specific settings (logging_contexts.<context_name>)
+# 2. Stream-specific settings (streams.<stream_name>)
+# 3. General defaults (general_defaults)
+
+# General defaults applied to all logging
+# --------------------------------------
+general_defaults:
+  # Default log level for all streams
+  level: "KEY"
+  
+  # Default log format
+  log_msg_format: "dflt: <green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+  
+  # Log directories
+  log_dir_run: "../../output/logs/udf2json" 
+  log_dir_viz: "./viz" # relative to log_dir_run
+  
+  # Stream enabling flags
+  console_enabled: true # doesn't work!!!, not respected, LEAVE IT TRUE!!!
+  file_enabled: true # work fo all files, but not for viz
+  error_file_enabled: true # works
+  run_file_enabled: true # works
+  
+  # Filename template for process-specific logs
+  # %[context_name] will be replaced with the actual context name
+  process_context_default_filename: "%[context_name]"
+
+# Stream-specific settings
+# -----------------------
+streams:
+  # Console output settings
+  console:
+    level: "KEY"
+    log_msg_format: "| <level>{level: <8}</level> | <green>{extra[context]: <41}</green> | <cyan>{name: <16}</cyan>:<cyan>{function: <22}</cyan>:<cyan>{line: <3}</cyan> - <level>{message}</level>"
+  
+  # Run file settings (complete log)
+  run_file:
+    level: "INFO"
+    log_msg_format: "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <magenta>{extra[context]: <41}</magenta> | <level>{level: <8}</level> | <cyan>{name: <22}</cyan>:<cyan>{function: <36}</cyan>:<cyan>{line: <3}</cyan> - <level>{message}</level>"
+  
+  # Context-specific file stream defaults
+  context_file:
+    level: "DEBUG"
+    log_msg_format: "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name: <22}</cyan>:<cyan>{function: <36}</cyan>:<cyan>{line: <3}</cyan> - <level>{message}</level>"
+  
+  # Error file stream
+  error_file:
+    level: "WARNING"
+    log_msg_format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
+
+# Context-specific settings
+# ------------------------
+# These override stream and general defaults
+logging_contexts:
+  # Example context (data_processing)
+  S01_context:
+    level: "KEY"
+    log_msg_format: "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <magenta>{extra[context]}</magenta> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+
+  S02_context:
+    level: "INFO"
+    log_msg_format: "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <green>{extra[context]}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+
+  # Visualization contexts can also have custom settings
+  # Format: viz_[name]
+  viz_chart:
+    level: "INFO"
+    log_msg_format: "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <magenta>{extra[context]}</magenta> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+
+
