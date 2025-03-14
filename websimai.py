@@ -11,6 +11,8 @@ import markdown2
 from xhtml2pdf import pisa
 import io
 
+
+
 from pandas.api.types import (
     is_datetime64_any_dtype,
     is_numeric_dtype,
@@ -583,13 +585,14 @@ def reset_chat():
     # Reinitialize the Gemini chat session
     if "gemini_chat_session" in st.session_state:
         # Get the existing model connection
-        gemini_model = llm_connect(st.secrets["GEMINI_API_KEY"])
+        gemini_model = llm_connect(st.secrets["GEMINI_API_KEY"]) # Connect to model only once
         if gemini_model:
             # Create a fresh chat session
             st.session_state.gemini_chat_session = gemini_model.start_chat()
             st.toast("Chat history reset successfully!")
         else:
             st.error("Failed to reinitialize Gemini Chat model.")
+            st.stop() # Stop if model initialization fails
 
 def format_chat_history_as_markdown() -> str:
     """
@@ -617,32 +620,182 @@ def format_chat_history_as_markdown() -> str:
 def convert_markdown_to_pdf_python(markdown_content: str, output_filename: str) -> bytes:
     """
     Converts Markdown content to PDF using markdown2 and xhtml2pdf (Python libraries).
+    Optimized for better table rendering and overall PDF quality.
 
     Args:
         markdown_content (str): The Markdown text to convert.
         output_filename (str): The desired filename for the PDF.
-
+        
     Returns:
         bytes: The PDF file content as bytes, ready for download.
-               Returns None and prints an error if conversion fails.
+              Returns None and prints an error if conversion fails.
     """
     try:
-        html_content = markdown2.markdown(markdown_content)
+        # Define CSS that works well with xhtml2pdf's limitations
+        css_styles = """
+        body {
+            font-family: Helvetica, Arial, sans-serif;
+            font-size: 10pt;
+            line-height: 1.3;
+            margin: 1cm;
+        }
+        
+        h1, h2, h3, h4, h5, h6 {
+            margin-top: 0.5cm;
+            margin-bottom: 0.2cm;
+            color: #2c3e50;
+            page-break-after: avoid;
+        }
+        
+        h1 { font-size: 18pt; }
+        h2 { font-size: 16pt; }
+        h3 { font-size: 14pt; }
+        h4 { font-size: 12pt; }
+        
+        p {
+            margin-bottom: 0.2cm;
+        }
+        
+        /* Table styling optimized for xhtml2pdf */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 0.5cm 0;
+            -pdf-keep-with-next: false;
+            -pdf-keep-in-frame-mode: shrink;
+        }
+        
+        th {
+            font-weight: bold;
+            background-color: #f2f2f2;
+            border: 1px solid #dddddd;
+            padding: 4px 8px;
+            text-align: left;
+            vertical-align: middle;
+        }
+        
+        td {
+            border: 1px solid #dddddd;
+            padding: 4px 8px;
+            text-align: left;
+            vertical-align: top;
+        }
+        
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        
+        /* Improved list styling for better spacing */
+        ul, ol {
+            margin-top: 0.1cm;
+            margin-bottom: 0.1cm;
+            margin-left: 0.3cm;
+            padding-left: 0.3cm;
+        }
+        
+        li {
+            margin-top: 0;
+            margin-bottom: 0.05cm;
+            line-height: 1.1;
+            padding-left: 0;
+        }
+        
+        /* Nested lists */
+        li ul, li ol {
+            margin-top: 0.05cm;
+            margin-bottom: 0;
+        }
+        
+        /* Bullet points appearance */
+        ul {
+            list-style-type: disc;
+        }
+        
+        ul ul {
+            list-style-type: circle;
+        }
+        
+        ul ul ul {
+            list-style-type: square;
+        }
+        
+        /* Code blocks */
+        pre, code {
+            font-family: Courier, monospace;
+            font-size: 9pt;
+            background-color: #f5f5f5;
+            border: 1px solid #e0e0e0;
+            padding: 4px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        /* Images */
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+        """
+        
+        # Convert Markdown to HTML with extended extras for better table support 
+        html_content = markdown2.markdown(
+            markdown_content,
+            extras=[
+                'tables',               # Enable table support
+                'code-friendly',        # Better code block handling
+                'cuddled-lists',        # Better list rendering
+                'markdown-in-html',     # Allow markdown inside HTML blocks
+                'break-on-newline',     # Line breaks on newlines
+                'header-ids'            # Add IDs to headers
+            ]
+        )
+        
+        # Create a complete HTML document with proper DOCTYPE and meta tags
+        full_html = f"""<!DOCTYPE html>
+                        <html>
+                        <head>
+                            <meta charset="UTF-8">
+                            <title>{output_filename}</title>
+                            <style type="text/css">
+                        {css_styles}
+                            </style>
+                        </head>
+                        <body>
+                        {html_content}
+                        </body>
+                        </html>"""
+        
+        # Create a BytesIO buffer for the PDF output
         pdf_buffer = io.BytesIO()
-        pdf_status = pisa.CreatePDF(html_content, dest=pdf_buffer)
-
+        
+        # Convert HTML to PDF with optimized settings
+        pdf_status = pisa.CreatePDF(
+            src=full_html,              # Complete HTML document
+            dest=pdf_buffer,            # Output buffer
+            encoding='UTF-8',           # Ensure proper character encoding
+            raise_exception=False,      # Don't raise exceptions for warnings
+            xhtml=False                 # Set to False to avoid XHTMLParser error 
+        )
+        
         if pdf_status.err:
             st.error(f"Error converting HTML to PDF using xhtml2pdf: {pdf_status.err}")
             return None
-
+            
+        # Get the PDF content from the buffer
+        pdf_buffer.seek(0)
         pdf_bytes = pdf_buffer.getvalue()
         pdf_buffer.close()
+        
         return pdf_bytes
+        
     except Exception as e:
         st.error(f"Error during Python-based PDF conversion: {e}")
         return None
-        
-st_init_page() #called outside of main() to not  be run once and not be included into reruns
+
+def convert_markdown_to_pdf_opt2(markdown_content: str, output_filename: str) -> bytes:
+    pass
+
+st_init_page() #called outside of main() to not  be run once and  not be incl uded into reruns
 
 def main():
     print("We are in main, RERUN")
@@ -941,7 +1094,7 @@ def main():
                     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
                     report_filename = f"Report_{timestamp}.md"
                     st.download_button("Download Report (Markdown)", st.session_state.generated_report, file_name=report_filename)
-                with col_dl2: # New column for PDF download
+                with col_dl2: # PDF download
                     if st.session_state.generated_report: # Only show if report is generated
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
                         pdf_filename = f"Report_{timestamp}" # Filename without extension for conversion function
@@ -956,6 +1109,23 @@ def main():
                         else:
                             st.warning("PDF conversion failed (Python-based). Check error messages above.") # Python-specific message                    else:
                             st.button("Download Report (PDF)", disabled=True) # Disable if no report
+
+                #placeholder for alternative PDF conversion
+                # with col_dl2: #  PDF download
+                #     if st.session_state.generated_report: # Only show if report is generated
+                #         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                #         pdf_filename = f"Report_{timestamp}" # Filename without extension for conversion function
+                #         pdf_bytes = convert_markdown_to_pdf_opt2(st.session_state.generated_report, pdf_filename) # Use markdown-pdf conversion
+                #         if pdf_bytes: # Check if PDF conversion was suc cessful
+                #             st.download_button(
+                #                 "Download Report (PDF)2",
+                #                 data=pdf_bytes,
+                #                 file_name=f"{pdf_filename}.pdf",
+                #                 mime="application/pdf"
+                #             )
+                #         else:
+                #             st.warning("PDF conversion failed (Python-based). Check error messages above.") # Python-specific message                    else:
+                #             st.button("Download Report (PDF)2", disabled=True) # Disable if no report
 
                 with col_dl3:
                     with st.popover("Token Stats"):
