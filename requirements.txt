@@ -3,3 +3,6 @@ pandas==2.2.3
 numpy==1.26.4
 loguru==0.7.2
 PyYAML==6.0.2
+google-generativeai>=0.6.15
+markdown2==2.5.3
+xhtml2pdf==0.2.17

@@ -3,12 +3,18 @@ import pandas as pd
 import os
 import sqlite3
 import json
-from typing import Dict, List, Tuple, Any 
+import tiktoken
+from typing import Dict, List, Tuple, Any, Optional, Union
+import google.generativeai as genai
+import datetime
+import markdown2
+from xhtml2pdf import pisa
+import io
 
 from pandas.api.types import (
     is_datetime64_any_dtype,
     is_numeric_dtype,
-    is_object_dtype,
+#    is_object_dtype,
 )
 
 SQLITE_DB_PATH = os.path.dirname(__file__)
@@ -95,14 +101,14 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # Try to convert datetimes into a standard format (datetime, no timezone)
     # temporarily disabled as it was pollution concole - need to deal with it later
-    for col in df.columns:
-        if is_object_dtype(df[col]):
-            try:
-                df[col] = pd.to_datetime(df[col])
-            except Exception:
-                pass
-        if is_datetime64_any_dtype(df[col]):
-            df[col] = df[col].dt.tz_localize(None)
+    # for col in df.columns:
+    #     if is_object_dtype(df[col]):
+    #         try:
+    #             df[col] = pd.to_datetime(df[col])
+    #         except Exception:
+    #             pass
+    #     if is_datetime64_any_dtype(df[col]):
+    #         df[col] = df[col].dt.tz_localize(None)
 
     modification_container = st.container()
 
@@ -347,6 +353,9 @@ def generate_json_of_selected() -> Dict[str, Any]:
     st.spinner("Generating JSON...")
     st.session_state.selected_in_json = convert_selected_df_to_json(st.session_state.selected_df)
     st.toast("JSON generated successfully")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    json_filename = f"JSON_{timestamp}.json"
+    st.session_state.json_filename = json_filename
 
     return st.session_state.selected_in_json
 
@@ -394,9 +403,246 @@ def add_instances(toggle: bool) -> None:
 
 def selection_changed():
     st.session_state.selected_in_json = {}
+    reset_report_generation()
 
+def count_tokens(
+    data: Union[str, Dict, List, pd.DataFrame, Any], 
+    model: Optional[str] = "cl100k_base",
+    truncate_to: Optional[int] = None) -> int:
+    """
+    Count tokens for various data types using tiktoken.
+    
+    This function serves as a universal wrapper for tiktoken's token counting,
+    supporting different data types including strings, dictionaries, lists,
+    pandas DataFrames, and other objects.
+    
+    Args:
+        data: Input data to count tokens for. Can be:
+              - str: Text string
+              - Dict/List: Will be converted to JSON
+              - DataFrame: Will be converted to records and then JSON
+              - Other types: Will be converted to string representation
+        model: Encoding model to use. Default is "cl100k_base" (used by GPT-3.5/4)
+              Other common options: "p50k_base" (GPT-3), "r50k_base" (Codex)
+        truncate_to: Optional maximum number of characters to consider
+                     (useful for large data where you only need an estimate)
+    
+    Returns:
+        int: Number of tokens in the data
+    """
+    print("Counting tokens...")
+    # Get the appropriate encoder
+    encoder = tiktoken.get_encoding(model)
+    
+    # Convert to string based on data type
+    if isinstance(data, str):
+        text = data
+    
+    elif isinstance(data, (dict, list)):
+        # Convert to JSON string
+        text = json.dumps(data)
+    
+    elif isinstance(data, pd.DataFrame):
+        # Check if DataFrame is empty
+        if data.empty:
+            return 0
+            
+        # Convert DataFrame to dict records and then to JSON
+        records = data.to_dict('records')
+        text = json.dumps(records)
+    
+    else:
+        # Fall back to string representation for other types
+        text = str(data)
+    
+    # Optionally truncate text for estimation on large data
+    if truncate_to and len(text) > truncate_to:
+        # Take a sample from the beginning, middle and end for better estimation
+        third = truncate_to // 3
+        text = text[:third] + text[len(text)//2-third//2:len(text)//2+third//2] + text[-third:]
+    
+    # Count tokens
+    return len(encoder.encode(text))
 
-st_init_page() #called outside of main() to not be run once and not be included into reruns
+def calculate_all_tokens(
+    prompt: Optional[str] = None, 
+    json_data: Optional[Union[Dict, List, pd.DataFrame]] = None,
+    response: Optional[str] = None,
+    model: Optional[str] = "cl100k_base") -> Dict[str, int]:
+    """
+    Calculate token counts for prompt, JSON data, and response.
+    
+    Args:
+        prompt: Optional prompt text
+        json_data: Optional JSON data (dict, list, or DataFrame)
+        response: Optional response text from LLM
+        model: Encoding model to use
+    
+    Returns:
+        Dictionary containing token counts for each component and totals
+    """
+    results = {
+        "prompt_tokens": count_tokens(prompt or "", model),
+        "json_tokens": count_tokens(json_data or {}, model),
+        "output_tokens": count_tokens(response or "", model)
+    }
+    
+    results["total_input_tokens"] = results["prompt_tokens"] + results["json_tokens"]
+    results["total_tokens"] = results["total_input_tokens"] + results["output_tokens"]
+    
+    return results
+
+def llm_connect(api_key: str, model_name: str = "gemini-2.0-flash"):
+    """
+    Connects to the Gemini API.
+
+    Args:
+        api_key (str): Gemini API key.
+        model_name (str): Name of the Gemini model to use.
+
+    Returns:
+        Any: Initialized Gemini model object, or None if connection fails.
+    """
+    try:
+        genai.configure(api_key=api_key) # Configure API key globally once
+        model = genai.GenerativeModel(model_name)
+        print(f"Successfully connected to Gemini model: {model_name}")
+        return model
+    except Exception as e:
+        st.error(f"Failed to connect to Gemini API: {e}")
+        return None
+
+def generate_llm_response(model: Any, system_prompt: str, user_prompt: str, json_data: Optional[Dict] = None, stream: bool = False) -> Union[str, Any]:
+    """
+    Generates a response from the Gemini LLM based on prompts and optional JSON data.
+    Supports both streaming and non-streaming responses.
+
+    Args:
+        model (Any): Initialized Gemini model object from llm_connect.
+        system_prompt (str): System-level instructions for the LLM.
+        user_prompt (str): User's query or request.
+        json_data (Optional[Dict], optional): JSON data to provide context to the LLM. Defaults to None.
+        stream (bool): If True, returns a streaming response; otherwise, returns the full response text.
+
+    Returns:
+        Union[str, Any]: Text response from the LLM if stream=False, or a streaming response iterator if stream=True.
+    """
+    prompt_content = f"{system_prompt}\n\n---\n\nUser Query: {user_prompt}"
+    if json_data:
+        prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, indent=2)}\n```"
+
+    try:
+        if stream:
+            response = model.generate_content(prompt_content, stream=True)
+            return response  # Corrected: Return the response object directly for streaming
+        else:
+            response = model.generate_content(prompt_content)
+            if response.parts: # Check if response is valid
+                return response.text
+            else:
+                return "No response from AI. Please check your prompt and data."
+    except Exception as e:
+        st.error(f"Error generating AI response: {e}")
+        return f"Error: {e}"
+
+def reset_report_generation():
+    st.session_state.report_sys_prompt = ""
+    st.session_state.report_user_prompt = ""
+    st.session_state.report_json_uploaded = None
+    st.session_state.generated_report = ""
+    st.session_state.gen_disabled = True
+    st.session_state.is_report_ready = False
+    st.session_state.report_generating = False
+    st.session_state.report_generated = False
+    st.session_state.json_source_option = "Upload JSON File"
+    st.session_state.report_token_stats = {}
+    
+    # Use a special flag to handle file uploader reset
+    # This avoids direct manipulation of the file uploader widget state
+    st.session_state.reset_report_widgets = True
+    
+    # Keep the json_source_option as is to avoid recreating the file uploader
+    # with the same key, which would cause an error
+    
+    #st.toast("Report generation reset successfully!")
+
+def reset_chat():
+    """
+    Reset the chat history and related session state variables.
+    Clears all messages and resets token counters to their initial state.
+    Also reinitializes the Gemini chat session.
+    """
+    # Reset message history and token counters
+    st.session_state.messages = []
+    st.session_state.prompt_tokens = 0
+    st.session_state.file_tokens = 0
+    st.session_state.total_tokens_out = 0
+    st.session_state.total_tokens_in = 0
+    st.session_state.chat_generating = False
+    
+    # Reinitialize the Gemini chat session
+    if "gemini_chat_session" in st.session_state:
+        # Get the existing model connection
+        gemini_model = llm_connect(st.secrets["GEMINI_API_KEY"])
+        if gemini_model:
+            # Create a fresh chat session
+            st.session_state.gemini_chat_session = gemini_model.start_chat()
+            st.toast("Chat history reset successfully!")
+        else:
+            st.error("Failed to reinitialize Gemini Chat model.")
+
+def format_chat_history_as_markdown() -> str:
+    """
+    Format the current chat history as a Markdown document.
+    
+    Returns:
+        str: Chat history formatted as Markdown
+    """
+    if not st.session_state.messages:
+        return "# Chat History\n\nNo messages in chat history."
+    
+    markdown_content = "# Chat History\n\n"
+    
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            markdown_content += f"## User Input:\n\n{message['prompt']}\n\n"
+            if "file_tokens" in message and message["file_tokens"] > 0 and message["file_name"] is not None:
+                markdown_content += f"*File: \"{message['file_name']}\" (tokens: {message['file_tokens']:,})*\n\n"
+        elif message["role"] == "AI":
+            markdown_content += f"## Response:\n\n{message['response']}\n\n"
+            markdown_content += "---\n\n"
+    
+    return markdown_content
+
+def convert_markdown_to_pdf_python(markdown_content: str, output_filename: str) -> bytes:
+    """
+    Converts Markdown content to PDF using markdown2 and xhtml2pdf (Python libraries).
+
+    Args:
+        markdown_content (str): The Markdown text to convert.
+        output_filename (str): The desired filename for the PDF.
+
+    Returns:
+        bytes: The PDF file content as bytes, ready for download.
+               Returns None and prints an error if conversion fails.
+    """
+    try:
+        html_content = markdown2.markdown(markdown_content)
+        pdf_buffer = io.BytesIO()
+        pdf_status = pisa.CreatePDF(html_content, dest=pdf_buffer)
+
+        if pdf_status.err:
+            st.error(f"Error converting HTML to PDF using xhtml2pdf: {pdf_status.err}")
+            return None
+
+        pdf_bytes = pdf_buffer.getvalue()
+        pdf_buffer.close()
+        return pdf_bytes
+    except Exception as e:
+        st.error(f"Error during Python-based PDF conversion: {e}")
+        return None
+        
+st_init_page() #called outside of main() to not  be run once and not be included into reruns
 
 def main():
     print("We are in main, RERUN")
@@ -408,7 +654,7 @@ def main():
 
     if "df_total_recs" not in st.session_state:
         st.session_state.df_total_recs = len(st.session_state.df)
-    
+
     # Display interactive dataframe with multi-row selection
     st.write(f"UDF Loaded, Total Records: **{st.session_state.df_total_recs}**")
     st.session_state.filtered_df = filter_dataframe(st.session_state.df)
@@ -438,7 +684,8 @@ def main():
 
     with col11:
         st.session_state.selected_df_recs = len(st.session_state.selected_df)
-        st.write(f"\nSelected records: **{st.session_state.selected_df_recs}**")
+        st.session_state.selected_df_tokens = count_tokens(st.session_state.selected_df)
+        st.write(f"\nSelected records: **{st.session_state.selected_df_recs}**, Tokens (est): **{st.session_state.selected_df_tokens:,}**")
 
     st.dataframe(st.session_state.selected_df, hide_index=True, use_container_width=True)
 
@@ -446,28 +693,340 @@ def main():
     if "selected_in_json" not in st.session_state:
         st.session_state.selected_in_json = {}
 
-    col21, col22 = st.columns([1,5])
+    json_col1, json_col2, json_col3, json_col4 = st.columns([2,3,5,2])
 
-    if st.session_state.selected_df_recs > 0:
-        with col21:
-            st.button("Generate JSON", on_click=generate_json_of_selected)
+    if st.session_state.selected_df_recs >0: #and len(st.session_state.selected_in_json) == 0:
+        json_col1.button("Generate JSON", on_click=generate_json_of_selected)
 
-    if st.session_state.selected_in_json:
-        with col22:
-            st.write("\nGenerated JSON:")
-            st.json(st.session_state.selected_in_json, expanded=3)
+    if len(st.session_state.selected_in_json) > 0:
+        with json_col2:
+            JSON_preview_msg = "Preview JSON"
+            with st.popover(JSON_preview_msg):
+                st.json(st.session_state.selected_in_json, expanded=3)
 
     if "json_filename" not in st.session_state:
-        st.session_state.json_filename = "UDF_selected.json"
+        st.session_state.json_filename = "selected.json"
 
     if st.session_state.selected_in_json:
-        with col21:
-            st.session_state.json_filename = st.text_input("JSON filename", value=st.session_state.json_filename)
-        with col21:
+        with json_col3:
+            st.session_state.json_filename = st.text_input("JSON filename", value=st.session_state.json_filename, label_visibility="collapsed")
+        with json_col4:
             st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, indent=2), st.session_state.json_filename)
 
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        st.session_state.prompt_tokens = 0
+        st.session_state.file_tokens = 0
+        st.session_state.total_tokens_out = 0
+        st.session_state.total_tokens_in = 0
+        st.session_state.chat_generating = False # Add chat_generating state
+
+
+    #if st.session_state.selected_in_json: # show chat bot container only if JSON is generated
+    gen_tab, chat_tab = st.tabs(["Generate Report", "Chat with AI"])
+    with chat_tab:
+        # Initialize ChatSession if it doesn't exist in session_state
+        if "gemini_chat_session" not in st.session_state:
+            gemini_model = llm_connect(st.secrets["GEMINI_API_KEY"]) # Connect to model only once
+            if gemini_model:
+                st.session_state.gemini_chat_session = gemini_model.start_chat()
+            else:
+                st.error("Failed to initialize Gemini Chat model.")
+                st.stop() # Stop if model initialization fails
+
+        chat_session = st.session_state.gemini_chat_session # Get the ChatSession from session state
+
+        # "If you finished preparing your JSON file and downloaded it, proceed to chat - input your fancy prompt, attach JSON file, and let it do its magic"
+        chat_placeholder = st.container(height=700) # Changed to placeholder
+
+        with chat_placeholder: # Use placeholder
+            # Display chat messages from history on app rerun
+            for message in st.session_state.messages:
+                if message["role"] == "user":
+                    with st.chat_message(message["role"]):
+                        st.markdown(f"{message["prompt"]}")
+                        if "file_tokens" in message and message["file_tokens"] > 0 and message["file_name"] is not None:
+                            st.markdown(f"File: \"*{message["file_name"]}*\" (tokens: {message["file_tokens"]:,})")
+                elif message["role"] == "AI":
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["response"]) # No changes here, response is already rendered
+
+        prompt = st.chat_input("Prompt, please?", accept_file=True, file_type="json", disabled=st.session_state.chat_generating) # Disable input while generating
+
+        # React to user input
+        with chat_placeholder: # Use placeholder
+            if prompt:
+                # Add user message to chat history (still needed for UI display)
+                if prompt:
+                    # Create a message dictionary with proper attribute access
+                    message = {
+                        "role": "user",
+                        "raw": prompt,  # Store the whole object if needed
+                        "prompt": prompt.text,  # Access text as an attribute
+                        "file_name": prompt.files[0].name if prompt.files else None,  # Get file name safely
+                        "file_content": None, # Initialize file_content to None
+                        "file_tokens": 0, # Initialize file_tokens to 0
+                        "prompt_tokens": count_tokens(prompt.text)
+                    }
+                    st.session_state.prompt_tokens += message["prompt_tokens"]
+                    st.session_state.total_tokens_out += message["prompt_tokens"]
+
+                json_data = None  # Initialize json_data to None here, before checking for files
+
+                if prompt.files:
+                    uploaded_file = prompt.files[0]
+                    # Read the file content
+                    file_content = uploaded_file.read()
+                    # If it's a JSON file, parse it
+                    if uploaded_file.type == 'application/json':
+                        json_data = json.loads(file_content)
+                        json_tokens = count_tokens(json_data)
+                        message["file_tokens"] = json_tokens
+                        message["file_content"] = json_data # Store json_data in message
+                        st.session_state.file_tokens += message["file_tokens"]
+                        st.session_state.total_tokens_out += message["file_tokens"]
+                    else:
+                        json_data = None # Handle non-JSON files if needed, or just ignore
+
+                st.session_state.messages.append(message)
+
+                # Display user message in chat message container
+                with st.chat_message("user"):
+                    st.markdown(f"{message['prompt']}")
+                    if "file_tokens" in message and message["file_tokens"] > 0 and message["file_name"] is not None:
+                        st.markdown(f"File: \"*{message['file_name']}*\" (tokens: {message['file_tokens']:,})")
+
+                # Initialize AI response message placeholder
+                with st.chat_message("AI"):
+                    response_placeholder = st.empty() # Placeholder for streaming response
+                    full_response_content = "" # Accumulate response for token counting
+                    st.session_state.chat_generating = True # Disable chat input 
+
+                    try: # Error handling for LLM call
+                        # Construct parts for send_message - include text and JSON data
+                        parts = [prompt.text] # Start with the text prompt
+                        if json_data:
+                            parts.append(json.dumps(json_data, indent=2)) # Add JSON data as a string
+
+                        # Use chat_session.send_message() with parts
+                        stream_response = chat_session.send_message(
+                            parts, # Pass the parts list here
+                            stream=True # Request streaming response
+                        )
+                        for chunk in stream_response: # Iterate through response chunks
+                            if chunk.text:
+                                full_response_content += chunk.text
+                                response_placeholder.markdown(full_response_content + "▌") # Display chunk with blinking cursor
+                        response_placeholder.markdown(full_response_content) # Final response without cursor
+
+                    except Exception as e: # Catch any exceptions during streaming
+                        full_response_content = f"Error generating response: {e}"
+                        response_placeholder.markdown(full_response_content)
+
+                    finally: # Code to execute after try or except
+                        st.session_state.chat_generating = False # Re-enable chat input
+
+                # Add assistant response to chat history - store full response content
+                ai_message = {
+                    "role": "AI",
+                    "response": full_response_content,
+                    "response_tokens": count_tokens(full_response_content)
+                }
+                st.session_state.messages.append(ai_message)
+                st.session_state.total_tokens_in += ai_message["response_tokens"]
+
+        chat_history_col, token_stats_col, download_col, reset_col = st.columns([3,3,3,3])
+
+        with chat_history_col:
+            with st.popover("[DEV] Chat history"):
+                st.write(st.session_state.messages)
+        with token_stats_col:
+            with st.popover("Token Stats"):
+                # Display token statistics
+                st.write("**Token Usage (est):**")
+                st.markdown(f"- Total Tokens Used: **{st.session_state.total_tokens_in + st.session_state.total_tokens_out:,}**")
+                st.markdown(f"- User Input: **{st.session_state.total_tokens_out:,}** (User Prompts: **{st.session_state.prompt_tokens:,}** Files sent: **{st.session_state.file_tokens:,}**)")
+                st.markdown(f"- LLM Response: **{st.session_state.total_tokens_in:,}**")
+        with download_col:
+            # Generate timestamp for filename in format YYYYMMDD_HHMM
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+            chat_filename = f"Chat_{timestamp}.md"
+            
+            # Create download button for chat history
+            if st.session_state.messages:  # Only show if there are messages
+                chat_markdown = format_chat_history_as_markdown()
+                st.download_button(
+                    "Download Chat", 
+                    chat_markdown, 
+                    file_name=chat_filename,
+                    mime="text/markdown"
+                )
+            else:
+                st.button("Download Chat", disabled=True)  # Disabled if no messages 
+            
+        with reset_col:
+            if st.session_state.messages:  # Only show if there are messages
+                st.button("Reset Chat", on_click=reset_chat, disabled = False)
+            else:
+                st.button("Reset Chat", disabled=True)  # Disabled if no messages
+
+# -----------------------------------------------------------------------------------------------------------------------------------
+
+    with gen_tab:
+        if st.session_state.selected_in_json:
+            if "is_report_ready" not in st.session_state:
+                st.session_state.is_report_ready = False
+                st.session_state.report_generating = False
+                st.session_state.report_generated = False
+                st.session_state.json_source_option = "Upload JSON File"
+                st.session_state.report_token_stats = {}
+                st.session_state.reset_report_widgets = False
+
+            if "gen_disabled" not in st.session_state:
+                st.session_state.gen_disabled = True
+
+            report_sys_prompt = st.text_area("System Prompt", 
+                                    value=st.session_state.get("report_sys_prompt", ""), 
+                                    key="report_sys_prompt", 
+                                    disabled=st.session_state.report_generated,
+                                    height=min(400, max(70,len(st.session_state.get("report_sys_prompt", "").split('\n')) * 25)))
+
+            report_user_prompt = st.text_area("User Prompt", 
+                                    value=st.session_state.get("report_user_prompt", ""), 
+                                    key="report_user_prompt", 
+                                    disabled=st.session_state.report_generated,
+                                    height=min(400, max(200,len(st.session_state.get("report_user_prompt", "").split('\n')) * 25)))
+
+            # JSON Source Selection - Radio Buttons
+            st.session_state.json_source_option = st.radio(
+                "Choose JSON Data Source:",
+                options=["Use Generated JSON","Upload JSON File"],
+                index=0,  # Default to "Use Generated JSON"
+                key="json_source_radio",
+                disabled=st.session_state.report_generated
+            )
+
+            if "report_json_uploaded" not in st.session_state:
+                report_json_uploaded = None # Initialize to None
+
+            # Handle file uploader with a unique key when reset is triggered
+            if st.session_state.json_source_option == "Upload JSON File":
+                # Generate a unique key for the file uploader if reset was triggered
+                uploader_key = f"report_json_uploaded_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}" if st.session_state.get("reset_report_widgets", False) else "report_json_uploaded"
+                
+                # Reset the flag after using it
+                if st.session_state.get("reset_report_widgets", False):
+                    st.session_state.reset_report_widgets = False
+                
+                report_json_uploaded = st.file_uploader("Upload JSON", type="json", key=uploader_key)
+            elif st.session_state.json_source_option == "Use Generated JSON":
+                st.info("Using the JSON generated from the selected data.") # Confirmation message
+                # No file uploader needed in this case
+
+            gen_disabled = False #(len(st.session_state.report_user_prompt) == 0)
+            st.session_state.gen_disabled = gen_disabled
+
+            if "generated_report" not in st.session_state:
+                st.session_state.generated_report = ""
+
+            if st.session_state.report_generated: # Display report if it exists
+                st.write("---")
+                st.subheader("Generated Report:")
+                st.markdown(st.session_state.generated_report)
+
+                # Download buttons
+                col_dl1, col_dl2, col_dl3, col_dl4 = st.columns(4)
+                with col_dl1:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                    report_filename = f"Report_{timestamp}.md"
+                    st.download_button("Download Report (Markdown)", st.session_state.generated_report, file_name=report_filename)
+                with col_dl2: # New column for PDF download
+                    if st.session_state.generated_report: # Only show if report is generated
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                        pdf_filename = f"Report_{timestamp}" # Filename without extension for conversion function
+                        pdf_bytes = convert_markdown_to_pdf_python(st.session_state.generated_report, pdf_filename) # Use Python-based conversion
+                        if pdf_bytes: # Check if PDF conversion was successful
+                            st.download_button(
+                                "Download Report (PDF)",
+                                data=pdf_bytes,
+                                file_name=f"{pdf_filename}.pdf",
+                                mime="application/pdf"
+                            )
+                        else:
+                            st.warning("PDF conversion failed (Python-based). Check error messages above.") # Python-specific message                    else:
+                            st.button("Download Report (PDF)", disabled=True) # Disable if no report
+
+                with col_dl3:
+                    with st.popover("Token Stats"):
+                        # Display token statistics
+                        st.write("**Token Usage (est):**")
+                        stats = st.session_state.report_token_stats
+                        st.markdown(f"- Total Tokens Used: **{stats.get('total_tokens', 0):,}**")
+                        st.markdown(f"- User Input: **{stats.get('total_input_tokens', 0):,}** ( Prompts: **{stats.get('prompt_tokens', 0):,}**, JSON: **{stats.get('json_tokens', 0):,}**)")
+                        st.markdown(f"- LLM Response: **{stats.get('output_tokens', 0):,}**")
+                with col_dl4:
+                    st.button("Reset Report Generation", on_click=reset_report_generation) # Reset button here
+
+
+            elif st.button("Generate Report", disabled=st.session_state.gen_disabled) and not st.session_state.report_generating: # Add check for report_generating state
+                st.session_state.gen_disabled = True
+                st.session_state.generated_report = ""
+                st.session_state.report_generating = True # Set state to generating
+                st.session_state.report_generated = False  # Reset generated state
+                st.session_state.report_token_stats = {}     # Reset token stats
+
+                # Display spinner while generating
+                with st.spinner("Generating report..."):
+                    # Determine JSON data source based on selection
+                    json_data_for_report = None
+                    if st.session_state.json_source_option == "Upload JSON File" and report_json_uploaded:
+                        json_data_for_report = json.load(report_json_uploaded)
+                    elif st.session_state.json_source_option == "Use Generated JSON" and st.session_state.selected_in_json:
+                        json_data_for_report = st.session_state.selected_in_json
+
+                    # Connect to Gemini and generate report
+                    gemini_model = llm_connect(st.secrets["GEMINI_API_KEY"])
+
+                    # Add instruction to avoid commentary in the system prompt
+                    report_sys_prompt = (
+                        "When generating the report based on user query, don't prepend it with "
+                        "your commentary like 'Okay, I received this user question', and don't "
+                        "end it with anything like that. \n\n" + report_sys_prompt
+                    )
+
+                    if gemini_model:
+                        report_text = generate_llm_response(
+                            gemini_model,
+                            report_sys_prompt,
+                            report_user_prompt,
+                            json_data_for_report
+                        )
+                        st.session_state.generated_report = report_text
+                        st.session_state.report_generated = True # Set state to generated
+                        st.session_state.rerun_required = True
+                        st.toast("Report generated successfully!")
+
+                        # Calculate and store token stats
+                        token_data = {
+                            "system_prompt": st.session_state.report_sys_prompt,
+                            "user_prompt": st.session_state.report_user_prompt,
+                            "json_data": json_data_for_report,
+                            "response": report_text
+                        }
+                        st.session_state.report_token_stats = calculate_all_tokens(
+                            prompt = token_data["system_prompt"] + "\n\n---\n\nUser Query: " + token_data["user_prompt"],
+                            json_data = token_data["json_data"],
+                            response = token_data["response"]
+                        )
+                
+                st.session_state.report_generating = False # Reset generating state
+                # st.session_state.gen_disabled = False # Re-enable button
+
+        if st.session_state.get("report_generated", False) and st.session_state.get("rerun_required", False):
+            print("inside rerun_required check")
+            st.session_state.rerun_required = False
+            st.rerun()   
 
 if __name__ == "__main__":
     main()
-
-
