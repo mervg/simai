@@ -6,3 +6,4 @@ PyYAML==6.0.2
 google-generativeai>=0.6.15
 markdown2==2.5.3
 xhtml2pdf==0.2.17
+tiktoken==0.9.0
