@@ -12,7 +12,6 @@ from xhtml2pdf import pisa
 import io
 
 
-
 from pandas.api.types import (
     is_datetime64_any_dtype,
     is_numeric_dtype,
@@ -538,8 +537,12 @@ def generate_llm_response(model: Any, system_prompt: str, user_prompt: str, json
             response = model.generate_content(prompt_content, stream=True)
             return response  # Corrected: Return the response object directly for streaming
         else:
-            response = model.generate_content(prompt_content)
-            if response.parts: # Check if response is valid
+            # Create generation config with temperature parameter
+            generation_config = {
+                "temperature": 0.3
+            }
+            response = model.generate_content(prompt_content, generation_config=generation_config)
+            if response.parts: # Check if response is valid 
                 return response.text
             else:
                 return "No response from AI. Please check your prompt and data."
