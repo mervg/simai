@@ -1,5 +1,10 @@
 import streamlit as st
 import pandas as pd
+from pandas.api.types import (
+    is_datetime64_any_dtype,
+    is_numeric_dtype,
+    is_object_dtype,
+)
 import os
 import sqlite3
 import json
@@ -11,12 +16,16 @@ import markdown2
 from xhtml2pdf import pisa
 import io
 
-
-from pandas.api.types import (
-    is_datetime64_any_dtype,
-    is_numeric_dtype,
-#    is_object_dtype,
-)
+# Custom JSON encoder for handling pandas Timestamp objects
+class TimestampJSONEncoder(json.JSONEncoder):
+    """
+    Custom JSON encoder that handles pandas Timestamp objects.
+    Converts Timestamp objects to ISO format strings for JSON serialization.
+    """
+    def default(self, obj):
+        if pd.api.types.is_datetime64_any_dtype(obj) or isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        return super().default(obj)
 
 SQLITE_DB_PATH = os.path.dirname(__file__)
 SQLITE_DB_FILENAME = os.path.join(SQLITE_DB_PATH, 'UDF.db')
@@ -28,43 +37,6 @@ GEMINI_PRICING = {
     "gemini-1.5-flash": {"input_char": 0.00001875, "output_char": 0.000075},
     "gemini-1.5-pro": {"input_char": 0.0003125, "output_char": 0.00125}
 }
-
-def calculate_gemini_cost(model_name, input_tokens, output_tokens):
-    """
-    Calculate cost based on token usage for Gemini models.
-    
-    Args:
-        model_name: The Gemini model name
-        input_tokens: Number of input tokens
-        output_tokens: Number of output tokens
-        
-    Returns:
-        Dictionary with input_cost, output_cost, and total_cost in USD
-    """
-    # Default to gemini-2.0-flash if model not found
-    model_name = model_name if model_name in GEMINI_PRICING else "gemini-2.0-flash"
-    pricing = GEMINI_PRICING[model_name]
-    
-    # For token-based models (Gemini 2.0)
-    if "input" in pricing:
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-    # For character-based models (Gemini 1.5)
-    else:
-        # Convert tokens to approximate characters (4 chars per token)
-        input_chars = input_tokens * 4
-        output_chars = output_tokens * 4
-        
-        input_cost = (input_chars / 1_000) * pricing["input_char"]
-        output_cost = (output_chars / 1_000) * pricing["output_char"]
-    
-    total_cost = input_cost + output_cost
-    
-    return {
-        "input_cost": input_cost,
-        "output_cost": output_cost,
-        "total_cost": total_cost
-    }
 
 def st_init_page() -> bool:
     st.set_page_config(
@@ -128,6 +100,40 @@ def load_udf_to_df(db_path: str) -> pd.DataFrame:
         # Return empty DataFrame
         return pd.DataFrame()
 
+def convert_date_format_agnostic(date_str):
+    """
+    Attempt to convert a date string to datetime using multiple formats.
+    If conversion fails, return the original string.
+    
+    Args:
+        date_str: The date string to convert
+        
+    Returns:
+        str: The date in ISO format if conversion was successful, or the original string if not
+    """
+    if pd.isna(date_str):
+        return date_str
+        
+    # Try multiple date formats
+    formats_to_try = [
+        'ISO8601',      # ISO format with T separator
+        '%Y-%m-%dT%H:%M:%S',  # Explicit ISO format
+        '%Y-%m-%d %H:%M:%S',  # Standard datetime format
+        '%Y-%m-%d'      # Just date
+    ]
+    
+    for fmt in formats_to_try:
+        try:
+            # Convert to datetime and then to ISO format string
+            dt = pd.to_datetime(date_str, format=fmt)
+            return dt.isoformat()
+        except Exception:
+            continue
+            
+    # If all conversions fail, keep the original value and log a warning
+    print(f"Warning: Failed to convert date value '{date_str}' to datetime")
+    return date_str
+
 def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds a UI on top of a dataframe to let viewers filter columns
@@ -138,23 +144,22 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         pd.DataFrame: Filtered dataframe
     """
-    modify = st.checkbox("Add filters")
+    modify = st.checkbox("Add filters", value=True)
 
     if not modify:
         return df
 
     df = df.copy()
 
-    # Try to convert datetimes into a standard format (datetime, no timezone)
-    # temporarily disabled as it was pollution concole - need to deal with it later
-    # for col in df.columns:
-    #     if is_object_dtype(df[col]):
-    #         try:
-    #             df[col] = pd.to_datetime(df[col])
-    #         except Exception:
-    #             pass
-    #     if is_datetime64_any_dtype(df[col]):
-    #         df[col] = df[col].dt.tz_localize(None)
+    # Only convert the udf_date column to datetime using a format-agnostic approach 
+    if 'udf_date' in df.columns and is_object_dtype(df['udf_date']):
+        # Define a function to convert a single date value with multiple format attempts
+        # Apply the conversion function to the udf_date column
+        df['udf_date'] = df['udf_date'].apply(convert_date_format_agnostic)
+        
+        # Remove timezone information if present
+        if is_datetime64_any_dtype(df['udf_date']):
+            df['udf_date'] = df['udf_date'].dt.tz_localize(None)
 
     modification_container = st.container()
 
@@ -189,6 +194,7 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                         df[column].min(),
                         df[column].max(),
                     ),
+                    format="DD/MM/YYYY",
                 )
                 if len(user_date_input) == 2:
                     user_date_input = tuple(map(pd.to_datetime, user_date_input))
@@ -199,7 +205,7 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     f"Substring or regex in {column}",
                 )
                 if user_text_input:
-                    df = df[df[column].astype(str).str.contains(user_text_input)]
+                    df = df[df[column].astype(str).str.contains(user_text_input, case=False)]
 
     return df
 
@@ -463,39 +469,31 @@ def count_tokens(
     pandas DataFrames, and other objects.
     
     Args:
-        data: Input data to count tokens for. Can be:
-              - str: Text string
-              - Dict/List: Will be converted to JSON
-              - DataFrame: Will be converted to records and then JSON
-              - Other types: Will be converted to string representation
-        model: Encoding model to use. Default is "cl100k_base" (used by GPT-3.5/4)
-              Other common options: "p50k_base" (GPT-3), "r50k_base" (Codex)
-        truncate_to: Optional maximum number of characters to consider
-                     (useful for large data where you only need an estimate)
+        data: The data to count tokens for. Can be a string, dictionary, list, 
+              pandas DataFrame, or other object.
+        model: The name of the tiktoken model to use for counting.
+        truncate_to: Optional maximum number of characters to consider for token counting.
+                     If provided, the text will be truncated to this length before counting.
     
     Returns:
-        int: Number of tokens in the data
+        int: The number of tokens in the data.
     """
-    print("Counting tokens...")
-    # Get the appropriate encoder
-    encoder = tiktoken.get_encoding(model)
+    # Get the appropriate encoder for the model
+    try:
+        encoder = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoder = tiktoken.get_encoding(model)
     
-    # Convert to string based on data type
+    # Convert data to text based on its type
     if isinstance(data, str):
         text = data
-    
     elif isinstance(data, (dict, list)):
-        # Convert to JSON string
-        text = json.dumps(data)
-    
+        # Convert dict/list to JSON string
+        text = json.dumps(data, separators=(',', ":"), cls=TimestampJSONEncoder)
     elif isinstance(data, pd.DataFrame):
-        # Check if DataFrame is empty
-        if data.empty:
-            return 0
-            
         # Convert DataFrame to dict records and then to JSON
         records = data.to_dict('records')
-        text = json.dumps(records)
+        text = json.dumps(records, separators=(',', ":"), cls=TimestampJSONEncoder)
     
     else:
         # Fall back to string representation for other types
@@ -546,6 +544,43 @@ def calculate_all_tokens(
     
     return results
 
+def calculate_gemini_cost(model_name, input_tokens, output_tokens):
+    """
+    Calculate cost based on token usage for Gemini models.
+    
+    Args:
+        model_name: The Gemini model name
+        input_tokens: Number of input tokens
+        output_tokens: Number of output tokens
+        
+    Returns:
+        Dictionary with input_cost, output_cost, and total_cost in USD
+    """
+    # Default to gemini-2.0-flash if model not found
+    model_name = model_name if model_name in GEMINI_PRICING else "gemini-2.0-flash"
+    pricing = GEMINI_PRICING[model_name]
+    
+    # For token-based models (Gemini 2.0)
+    if "input" in pricing:
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    # For character-based models (Gemini 1.5)
+    else:
+        # Convert tokens to approximate characters (4 chars per token)
+        input_chars = input_tokens * 4
+        output_chars = output_tokens * 4
+        
+        input_cost = (input_chars / 1_000) * pricing["input_char"]
+        output_cost = (output_chars / 1_000) * pricing["output_char"]
+    
+    total_cost = input_cost + output_cost
+    
+    return {
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": total_cost
+    }
+
 def llm_connect(api_key: str, model_name: str = "gemini-2.0-flash"):
     """
     Connects to the Gemini API.
@@ -566,6 +601,33 @@ def llm_connect(api_key: str, model_name: str = "gemini-2.0-flash"):
         st.error(f"Failed to connect to Gemini API: {e}")
         return None
 
+def prepare_prompt(
+    system_prompt: str, 
+    user_prompt: str, 
+    json_data: Optional[Union[Dict, List]] = None
+    ) -> str:
+    """
+    Prepare a prompt for the LLM by combining system prompt, user prompt, and optional JSON data.
+    
+    Args:
+        system_prompt: The system prompt to use
+        user_prompt: The user prompt to use
+        json_data: Optional JSON data to include in the prompt
+        
+    Returns:
+        str: The combined prompt
+    """
+    prompt_content = f"{system_prompt}\n\n---\n\nUser Query: {user_prompt}"
+    if json_data:
+        # prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, indent=2)}\n```"
+        prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, separators=(',', ":"), cls=TimestampJSONEncoder)}\n```" ## no indentation added for AI JSON data, otherwise the JSON becomes too bloated
+
+    # Store system and user prompts in session state for report generation log
+    st.session_state.report_log_sys_prompt = system_prompt
+    st.session_state.report_log_user_prompt = user_prompt
+    
+    return prompt_content
+
 def generate_llm_response(model: Any, system_prompt: str, user_prompt: str, json_data: Optional[Dict] = None, stream: bool = False) -> Union[str, Any]:
     """
     Generates a response from the Gemini LLM based on prompts and optional JSON data.
@@ -582,11 +644,7 @@ def generate_llm_response(model: Any, system_prompt: str, user_prompt: str, json
     Returns:
         Union[str, Any]: Text response from the LLM if stream=False, or a streaming response iterator if stream=True.
     """
-    prompt_content = f"{system_prompt}\n\n---\n\nUser Query: {user_prompt}"
-    if json_data:
-        # prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, indent=2)}\n```"
-        prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, separators=(',', ":"))}\n```" ## no  indentation added for AI JSON data, otherwise the JSON becomes too bloated
-
+    prompt_content = prepare_prompt(system_prompt, user_prompt, json_data)
     # Store system and user prompts in session state for report generation log
     st.session_state.report_log_sys_prompt = system_prompt
     st.session_state.report_log_user_prompt = user_prompt
@@ -902,7 +960,36 @@ def convert_markdown_to_pdf_python(markdown_content: str, output_filename: str) 
 def convert_markdown_to_pdf_opt2(markdown_content: str, output_filename: str) -> bytes:
     pass
 
-st_init_page() #called outside of main() to not  be run once and  not be incl uded into reruns
+def get_default_system_prompt():
+    """
+    Read the default system prompt from a file and prepend today's date.
+    
+    Returns:
+        str: The content of the default_sys_prompt.md file with today's date prepended,
+             or an empty string if the file doesn't exist.
+    """
+    try:
+        # Get today's date in the required format
+        today = datetime.datetime.now().strftime("%d %B %Y")
+        date_prefix = f"Today's date: {today}\n\n"
+        
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        prompt_file_path = os.path.join(script_dir, "default_sys_prompt.md")
+        
+        # Check if the file exists
+        if os.path.exists(prompt_file_path):
+            with open(prompt_file_path, 'r', encoding='utf-8') as file:
+                file_content = file.read()
+                return date_prefix + file_content
+        else:
+            print(f"Warning: Default system prompt file not found at {prompt_file_path}")
+            return date_prefix
+    except Exception as e:
+        print(f"Error reading default system prompt: {e}")
+        return ""
+
+st_init_page() #called outside of main() to not  be run once and  not be incl uded into reruns 
 
 def main():
     print("We are in main, RERUN")
@@ -972,7 +1059,7 @@ def main():
             st.session_state.json_filename = st.text_input("JSON filename", value=st.session_state.json_filename, label_visibility="collapsed")
         with json_col4:
             # st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, indent=2), st.session_state.json_filename)
-            st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, separators=(',', ":")), st.session_state.json_filename) ## no indentation added for AI JSON data, otherwise the JSON becomes too bloated
+            st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, separators=(',', ":"), cls=TimestampJSONEncoder), st.session_state.json_filename) ## no indentation added for AI JSON data, otherwise the JSON becomes too bloated
 
     # Initialize chat history
     if "messages" not in st.session_state:
@@ -1097,7 +1184,7 @@ def main():
                                 last_chunk = chunk  # Store the last chunk to access metadata
                                 if chunk.text:
                                     full_response_content += chunk.text
-                                    response_placeholder.markdown(full_response_content + "▌") # Display chunk with blinking cursor
+                                    response_placeholder.markdown(full_response_content + "▌") # Display chunk with blinking cursor 
                         response_placeholder.markdown(full_response_content) # Final response without cursor
 
                         # Check for usage metadata in the last chunk
@@ -1216,6 +1303,7 @@ def main():
             if "gen_disabled" not in st.session_state:
                 st.session_state.gen_disabled = True
 
+            default_system_prompt = get_default_system_prompt()
             report_sys_prompt = st.text_area("System Prompt", 
                                     value=st.session_state.get("report_log_sys_prompt", ""), 
                                     key="report_sys_prompt", 
@@ -1385,14 +1473,13 @@ def main():
                     # Connect to Gemini and generate report
                     gemini_model = llm_connect(st.secrets["GEMINI_API_KEY"])
 
-                    # Add instruction to avoid commentary in the system prompt
-                    report_sys_prompt = (
-                        "When generating the report based on user query, don't prepend it with "
-                        "your commentary like 'Okay, I received this user question', and don't "
-                        "end it with anything like that. \n\n" + report_sys_prompt
-                    )
+                    # Add instruction to avoid commentary in the system prompt 
+                    report_sys_prompt = default_system_prompt+ "\n\n" + report_sys_prompt
 
                     if gemini_model:
+                        # Save the system prompt for the report log
+                        # st.session_state.report_log_sys_prompt = report_sys_prompt
+                        
                         report_text = generate_llm_response(
                             gemini_model,
                             report_sys_prompt,
