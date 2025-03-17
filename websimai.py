@@ -21,6 +21,51 @@ from pandas.api.types import (
 SQLITE_DB_PATH = os.path.dirname(__file__)
 SQLITE_DB_FILENAME = os.path.join(SQLITE_DB_PATH, 'UDF.db')
 
+# Pricing constants for Gemini models (per million tokens)
+GEMINI_PRICING = {
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
+    "gemini-1.5-flash": {"input_char": 0.00001875, "output_char": 0.000075},
+    "gemini-1.5-pro": {"input_char": 0.0003125, "output_char": 0.00125}
+}
+
+def calculate_gemini_cost(model_name, input_tokens, output_tokens):
+    """
+    Calculate cost based on token usage for Gemini models.
+    
+    Args:
+        model_name: The Gemini model name
+        input_tokens: Number of input tokens
+        output_tokens: Number of output tokens
+        
+    Returns:
+        Dictionary with input_cost, output_cost, and total_cost in USD
+    """
+    # Default to gemini-2.0-flash if model not found
+    model_name = model_name if model_name in GEMINI_PRICING else "gemini-2.0-flash"
+    pricing = GEMINI_PRICING[model_name]
+    
+    # For token-based models (Gemini 2.0)
+    if "input" in pricing:
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    # For character-based models (Gemini 1.5)
+    else:
+        # Convert tokens to approximate characters (4 chars per token)
+        input_chars = input_tokens * 4
+        output_chars = output_tokens * 4
+        
+        input_cost = (input_chars / 1_000) * pricing["input_char"]
+        output_cost = (output_chars / 1_000) * pricing["output_char"]
+    
+    total_cost = input_cost + output_cost
+    
+    return {
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": total_cost
+    }
+
 def st_init_page() -> bool:
     st.set_page_config(
         page_title="WebSIMAI - UDF Explorer",
@@ -228,7 +273,7 @@ def process_json_structure(records: List[Dict[str, Any]], columns: List[str]) ->
             - Structured JSON data dictionary with 'records' key
             - Records grouped by udf_type for relationship analysis
     """
-    # Convert records to dictionaries with JSON parsing for meta fields
+    # Convert records to dictionaries with JSON parsing for meta fields 
     record_dicts = []
     for record in records:
         record_dict = {}
@@ -469,18 +514,20 @@ def calculate_all_tokens(
     prompt: Optional[str] = None, 
     json_data: Optional[Union[Dict, List, pd.DataFrame]] = None,
     response: Optional[str] = None,
-    model: Optional[str] = "cl100k_base") -> Dict[str, int]:
+    model: Optional[str] = "cl100k_base",
+    gemini_model: Optional[str] = "gemini-2.0-flash") -> Dict[str, int]:
     """
-    Calculate token counts for prompt, JSON data, and response.
+    Calculate token counts and costs for prompt, JSON data, and response.
     
     Args:
         prompt: Optional prompt text
         json_data: Optional JSON data (dict, list, or DataFrame)
         response: Optional response text from LLM
-        model: Encoding model to use
+        model: Encoding model to use for token counting
+        gemini_model: Gemini model name for cost calculation
     
     Returns:
-        Dictionary containing token counts for each component and totals
+        Dictionary containing token counts and costs for each component and totals
     """
     results = {
         "prompt_tokens": count_tokens(prompt or "", model),
@@ -490,6 +537,12 @@ def calculate_all_tokens(
     
     results["total_input_tokens"] = results["prompt_tokens"] + results["json_tokens"]
     results["total_tokens"] = results["total_input_tokens"] + results["output_tokens"]
+    
+    # Calculate costs based on token counts
+    costs = calculate_gemini_cost(gemini_model, results["total_input_tokens"], results["output_tokens"])
+    results["input_cost"] = costs["input_cost"]
+    results["output_cost"] = costs["output_cost"]
+    results["total_cost"] = costs["total_cost"]
     
     return results
 
@@ -517,6 +570,7 @@ def generate_llm_response(model: Any, system_prompt: str, user_prompt: str, json
     """
     Generates a response from the Gemini LLM based on prompts and optional JSON data.
     Supports both streaming and non-streaming responses.
+    For non-streaming responses, uses Gemini's native token counting for accurate token statistics.
 
     Args:
         model (Any): Initialized Gemini model object from llm_connect.
@@ -530,29 +584,67 @@ def generate_llm_response(model: Any, system_prompt: str, user_prompt: str, json
     """
     prompt_content = f"{system_prompt}\n\n---\n\nUser Query: {user_prompt}"
     if json_data:
-        prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, indent=2)}\n```"
+        # prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, indent=2)}\n```"
+        prompt_content += f"\n\n---\n\nData (JSON):\n```json\n{json.dumps(json_data, separators=(',', ":"))}\n```" ## no  indentation added for AI JSON data, otherwise the JSON becomes too bloated
+
+    # Store system and user prompts in session state for report generation log
+    st.session_state.report_log_sys_prompt = system_prompt
+    st.session_state.report_log_user_prompt = user_prompt
+    
+    # Pre-calculate estimated token counts (used as fallback if native counting fails)
+    estimated_tokens = calculate_all_tokens(
+        prompt=prompt_content,
+        json_data=json_data,
+        response=None  # No response yet
+    )
 
     try:
         if stream:
             response = model.generate_content(prompt_content, stream=True)
-            return response  # Corrected: Return the response object directly for streaming
+            # For streaming, we use the estimated token counts
+            st.session_state.report_token_stats = estimated_tokens
+            return response  # Return the response object directly for streaming
         else:
             # Create generation config with temperature parameter
             generation_config = {
                 "temperature": 0.3
             }
             response = model.generate_content(prompt_content, generation_config=generation_config)
-            if response.parts: # Check if response is valid 
-                return response.text
+            
+            if response.parts:  # Check if response is valid
+                report_text = response.text
+                st.session_state.generated_report = report_text
+                
+                # Get accurate token counts from Gemini's response metadata if available
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    # Extract actual token counts from response metadata
+                    actual_tokens = {
+                        "prompt_tokens": getattr(response.usage_metadata, 'prompt_token_count', estimated_tokens["prompt_tokens"]),
+                        "json_tokens": estimated_tokens["json_tokens"],  # Keep estimated JSON tokens since Gemini doesn't separate this
+                        "output_tokens": getattr(response.usage_metadata, 'candidates_token_count', estimated_tokens["output_tokens"]),
+                        "total_input_tokens": getattr(response.usage_metadata, 'prompt_token_count', estimated_tokens["total_input_tokens"]),
+                        "total_tokens": getattr(response.usage_metadata, 'total_token_count', estimated_tokens["total_tokens"])
+                    }
+                    st.session_state.report_token_stats = actual_tokens
+                else:
+                    # Fall back to estimated counts if metadata not available
+                    output_tokens = count_tokens(report_text)
+                    estimated_tokens["output_tokens"] = output_tokens
+                    estimated_tokens["total_tokens"] = estimated_tokens["total_input_tokens"] + output_tokens
+                    st.session_state.report_token_stats = estimated_tokens
+                
+                return report_text
             else:
                 return "No response from AI. Please check your prompt and data."
     except Exception as e:
         st.error(f"Error generating AI response: {e}")
+        # In case of error, still provide estimated token counts
+        st.session_state.report_token_stats = estimated_tokens
         return f"Error: {e}"
 
 def reset_report_generation():
-    st.session_state.report_sys_prompt = ""
-    st.session_state.report_user_prompt = ""
+    st.session_state.report_log_sys_prompt = ""
+    st.session_state.report_log_user_prompt = ""
     st.session_state.report_json_uploaded = None
     st.session_state.generated_report = ""
     st.session_state.gen_disabled = True
@@ -583,6 +675,18 @@ def reset_chat():
     st.session_state.file_tokens = 0
     st.session_state.total_tokens_out = 0
     st.session_state.total_tokens_in = 0
+    st.session_state.chat_token_stats = {
+        'total_tokens': 0,
+        'total_input_tokens': 0,
+        'total_output_tokens': 0,
+        'prompt_tokens': 0,
+        'json_tokens': 0,
+        'response_tokens': 0,
+        'using_native_counts': False,
+        'input_cost': 0.0,
+        'output_cost': 0.0,
+        'total_cost': 0.0
+    }
     st.session_state.chat_generating = False
     
     # Reinitialize the Gemini chat session
@@ -867,7 +971,8 @@ def main():
         with json_col3:
             st.session_state.json_filename = st.text_input("JSON filename", value=st.session_state.json_filename, label_visibility="collapsed")
         with json_col4:
-            st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, indent=2), st.session_state.json_filename)
+            # st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, indent=2), st.session_state.json_filename)
+            st.download_button("Download JSON", json.dumps(st.session_state.selected_in_json, separators=(',', ":")), st.session_state.json_filename) ## no indentation added for AI JSON data, otherwise the JSON becomes too bloated
 
     # Initialize chat history
     if "messages" not in st.session_state:
@@ -877,7 +982,21 @@ def main():
         st.session_state.total_tokens_out = 0
         st.session_state.total_tokens_in = 0
         st.session_state.chat_generating = False # Add chat_generating state
-
+        
+    # Ensure chat_token_stats is always initialized separately 
+    if "chat_token_stats" not in st.session_state:
+        st.session_state.chat_token_stats = {
+            'total_tokens': 0,
+            'total_input_tokens': 0,
+            'total_output_tokens': 0,
+            'prompt_tokens': 0,
+            'json_tokens': 0,
+            'response_tokens': 0,
+            'using_native_counts': False,
+            'input_cost': 0.0,
+            'output_cost': 0.0,
+            'total_cost': 0.0
+        }
 
     #if st.session_state.selected_in_json: # show chat bot container only if JSON is generated
     gen_tab, chat_tab = st.tabs(["Generate Report", "Chat with AI"])
@@ -963,34 +1082,78 @@ def main():
                         # Construct parts for send_message - include text and JSON data
                         parts = [prompt.text] # Start with the text prompt
                         if json_data:
-                            parts.append(json.dumps(json_data, indent=2)) # Add JSON data as a string
+                            # parts.append(json.dumps(json_data, indent=2)) # Add JSON data as a string
+                            parts.append(json.dumps(json_data, separators=(',', ":"))) # Add JSON data as a string, without indentations otherwise it becomes too bloated
+                           
 
                         # Use chat_session.send_message() with parts
                         stream_response = chat_session.send_message(
                             parts, # Pass the parts list here
                             stream=True # Request streaming response
                         )
+                        last_chunk = None
                         for chunk in stream_response: # Iterate through response chunks
-                            if chunk.text:
-                                full_response_content += chunk.text
-                                response_placeholder.markdown(full_response_content + "▌") # Display chunk with blinking cursor
+                            if chunk:
+                                last_chunk = chunk  # Store the last chunk to access metadata
+                                if chunk.text:
+                                    full_response_content += chunk.text
+                                    response_placeholder.markdown(full_response_content + "▌") # Display chunk with blinking cursor
                         response_placeholder.markdown(full_response_content) # Final response without cursor
+
+                        # Check for usage metadata in the last chunk
+                        has_native_counts = False
+                        if last_chunk and hasattr(last_chunk, 'usage_metadata'):
+                            usage_metadata = last_chunk.usage_metadata
+                            if hasattr(usage_metadata, 'prompt_token_count') and hasattr(usage_metadata, 'candidates_token_count'):
+                                has_native_counts = True
+                                # Calculate costs once
+                                costs = calculate_gemini_cost(
+                                    "gemini-2.0-flash", 
+                                    usage_metadata.prompt_token_count, 
+                                    usage_metadata.candidates_token_count
+                                )
+                                
+                                # Update chat token stats with actual token counts and costs
+                                st.session_state.chat_token_stats = {
+                                    'total_tokens': st.session_state.chat_token_stats.get('total_tokens', 0) + usage_metadata.total_token_count,
+                                    'total_input_tokens': st.session_state.chat_token_stats.get('total_input_tokens', 0) + usage_metadata.prompt_token_count,
+                                    'total_output_tokens': st.session_state.chat_token_stats.get('total_output_tokens', 0) + usage_metadata.candidates_token_count,
+                                    'prompt_tokens': st.session_state.prompt_tokens,  # Keep existing count for user prompts
+                                    'json_tokens': st.session_state.file_tokens,  # Keep existing count for JSON files
+                                    'response_tokens': st.session_state.chat_token_stats.get('response_tokens', 0) + usage_metadata.candidates_token_count,
+                                    'using_native_counts': True,
+                                    'input_cost': st.session_state.chat_token_stats.get('input_cost', 0.0) + costs['input_cost'],
+                                    'output_cost': st.session_state.chat_token_stats.get('output_cost', 0.0) + costs['output_cost'],
+                                    'total_cost': st.session_state.chat_token_stats.get('total_cost', 0.0) + costs['total_cost']
+                                }
 
                     except Exception as e: # Catch any exceptions during streaming
                         full_response_content = f"Error generating response: {e}"
                         response_placeholder.markdown(full_response_content)
+                        has_native_counts = False
 
                     finally: # Code to execute after try or except
                         st.session_state.chat_generating = False # Re-enable chat input
 
                 # Add assistant response to chat history - store full response content
+                estimated_tokens = count_tokens(full_response_content)
                 ai_message = {
                     "role": "AI",
                     "response": full_response_content,
-                    "response_tokens": count_tokens(full_response_content)
+                    "response_tokens": estimated_tokens
                 }
+                
+                # If we have native token counts, add them to the message
+                if 'has_native_counts' in locals() and has_native_counts:
+                    ai_message["native_response_tokens"] = usage_metadata.candidates_token_count
+                    ai_message["native_prompt_tokens"] = usage_metadata.prompt_token_count
+                    ai_message["native_total_tokens"] = usage_metadata.total_token_count
+                    ai_message["using_native_counts"] = True
+                else:
+                    # Still update the total tokens with estimated count for backward compatibility 
+                    st.session_state.total_tokens_in += estimated_tokens
+                
                 st.session_state.messages.append(ai_message)
-                st.session_state.total_tokens_in += ai_message["response_tokens"]
 
         chat_history_col, token_stats_col, download_col, reset_col = st.columns([3,3,3,3])
 
@@ -1000,10 +1163,23 @@ def main():
         with token_stats_col:
             with st.popover("Token Stats"):
                 # Display token statistics
-                st.write("**Token Usage (est):**")
-                st.markdown(f"- Total Tokens Used: **{st.session_state.total_tokens_in + st.session_state.total_tokens_out:,}**")
-                st.markdown(f"- User Input: **{st.session_state.total_tokens_out:,}** (User Prompts: **{st.session_state.prompt_tokens:,}** Files sent: **{st.session_state.file_tokens:,}**)")
-                st.markdown(f"- LLM Response: **{st.session_state.total_tokens_in:,}**")
+                if st.session_state.chat_token_stats.get('using_native_counts', False):
+                    st.write("**Token Usage (actual):**")
+                    stats = st.session_state.chat_token_stats
+                    st.markdown(f"- Total Tokens Used: **{stats.get('total_tokens', 0):,}**")
+                    st.markdown(f"- User Input: **{stats.get('total_input_tokens', 0):,}** (User Prompts: **{stats.get('prompt_tokens', 0):,}** Files sent: **{stats.get('json_tokens', 0):,}**)")
+                    st.markdown(f"- LLM Response: **{stats.get('total_output_tokens', 0):,}**")
+                    
+                    # Display cost information
+                    st.write("**Cost Estimation (USD):**")
+                    st.markdown(f"- Input Cost: **${stats.get('input_cost', 0.0):.6f}**")
+                    st.markdown(f"- Output Cost: **${stats.get('output_cost', 0.0):.6f}**")
+                    st.markdown(f"- Total Cost: **${stats.get('total_cost', 0.0):.6f}**")
+                else:
+                    st.write("**Token Usage (est):**")
+                    st.markdown(f"- Total Tokens Used: **{st.session_state.total_tokens_in + st.session_state.total_tokens_out:,}**")
+                    st.markdown(f"- User Input: **{st.session_state.total_tokens_out:,}** (User Prompts: **{st.session_state.prompt_tokens:,}** Files sent: **{st.session_state.file_tokens:,}**)")
+                    st.markdown(f"- LLM Response: **{st.session_state.total_tokens_in:,}**")
         with download_col:
             # Generate timestamp for filename in format YYYYMMDD_HHMM
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
@@ -1027,8 +1203,6 @@ def main():
             else:
                 st.button("Reset Chat", disabled=True)  # Disabled if no messages
 
-# -----------------------------------------------------------------------------------------------------------------------------------
-
     with gen_tab:
         if st.session_state.selected_in_json:
             if "is_report_ready" not in st.session_state:
@@ -1043,16 +1217,16 @@ def main():
                 st.session_state.gen_disabled = True
 
             report_sys_prompt = st.text_area("System Prompt", 
-                                    value=st.session_state.get("report_sys_prompt", ""), 
+                                    value=st.session_state.get("report_log_sys_prompt", ""), 
                                     key="report_sys_prompt", 
                                     disabled=st.session_state.report_generated,
-                                    height=min(400, max(70,len(st.session_state.get("report_sys_prompt", "").split('\n')) * 25)))
+                                    height=min(400, max(70,len(st.session_state.get("report_log_sys_prompt", "").split('\n')) * 25)))
 
             report_user_prompt = st.text_area("User Prompt", 
-                                    value=st.session_state.get("report_user_prompt", ""), 
+                                    value=st.session_state.get("report_log_user_prompt", ""), 
                                     key="report_user_prompt", 
                                     disabled=st.session_state.report_generated,
-                                    height=min(400, max(200,len(st.session_state.get("report_user_prompt", "").split('\n')) * 25)))
+                                    height=min(400, max(200,len(st.session_state.get("report_log_user_prompt", "").split('\n')) * 25)))
 
             # JSON Source Selection - Radio Buttons
             st.session_state.json_source_option = st.radio(
@@ -1092,12 +1266,12 @@ def main():
                 st.markdown(st.session_state.generated_report)
 
                 # Download buttons
-                col_dl1, col_dl2, col_dl3, col_dl4 = st.columns(4)
-                with col_dl1:
+                col_dlmd, col_dlpdf, col_dllog, col_tokens, col_reset = st.columns(5)
+                with col_dlmd:
                     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
                     report_filename = f"Report_{timestamp}.md"
                     st.download_button("Download Report (Markdown)", st.session_state.generated_report, file_name=report_filename)
-                with col_dl2: # PDF download
+                with col_dlpdf: # PDF download
                     if st.session_state.generated_report: # Only show if report is generated
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
                         pdf_filename = f"Report_{timestamp}" # Filename without extension for conversion function
@@ -1128,17 +1302,67 @@ def main():
                 #             )
                 #         else:
                 #             st.warning("PDF conversion failed (Python-based). Check error messages above.") # Python-specific message                    else:
-                #             st.button("Download Report (PDF)2", disabled=True) # Disable if no report
+                #             st.button("Download Report (PDF)2", disabled=True) # Disable if no report  
 
-                with col_dl3:
+                with col_dllog:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                    genlog_filename = f"Report_genlog_{timestamp}.md"
+                    
+                    # Create the report generation log content
+                    current_datetime = datetime.datetime.now().strftime("%d %B %Y, %H:%M:%S")
+                    stats = st.session_state.report_token_stats
+                    
+                    report_log_content = f"""# Report Generation Log
+
+## Generated: {current_datetime}
+
+## Token Statistics
+- Total Tokens Used: **{stats.get('total_tokens', 0):,}**
+- User Input: **{stats.get('total_input_tokens', 0):,}** (Prompts: **{stats.get('prompt_tokens', 0):,}**, JSON: **{stats.get('json_tokens', 0):,}**)
+- LLM Response: **{stats.get('output_tokens', 0):,}**
+
+## Cost Estimation (USD)
+- Input Cost: **${stats.get('input_cost', 0.0):.6f}**
+- Output Cost: **${stats.get('output_cost', 0.0):.6f}**
+- Total Cost: **${stats.get('total_cost', 0.0):.6f}**
+
+## System Prompt
+```
+{st.session_state.report_log_sys_prompt}
+```
+
+## User Prompt
+```
+{st.session_state.report_log_user_prompt}
+```
+
+---
+
+## Response
+{st.session_state.generated_report}
+"""
+                    
+                    st.download_button(
+                        "Download Report Generation Log (MD)", 
+                        report_log_content, 
+                        file_name=genlog_filename
+                    )
+                
+                with col_tokens:
                     with st.popover("Token Stats"):
                         # Display token statistics
-                        st.write("**Token Usage (est):**")
+                        st.write("**Token Usage (actual):**")
                         stats = st.session_state.report_token_stats
                         st.markdown(f"- Total Tokens Used: **{stats.get('total_tokens', 0):,}**")
                         st.markdown(f"- User Input: **{stats.get('total_input_tokens', 0):,}** ( Prompts: **{stats.get('prompt_tokens', 0):,}**, JSON: **{stats.get('json_tokens', 0):,}**)")
                         st.markdown(f"- LLM Response: **{stats.get('output_tokens', 0):,}**")
-                with col_dl4:
+                        
+                        # Display cost information
+                        st.write("**Cost Estimation (USD):**")
+                        st.markdown(f"- Input Cost: **${stats.get('input_cost', 0.0):.6f}**")
+                        st.markdown(f"- Output Cost: **${stats.get('output_cost', 0.0):.6f}**")
+                        st.markdown(f"- Total Cost: **${stats.get('total_cost', 0.0):.6f}**")
+                with col_reset:
                     st.button("Reset Report Generation", on_click=reset_report_generation) # Reset button here
 
 
@@ -1147,7 +1371,7 @@ def main():
                 st.session_state.generated_report = ""
                 st.session_state.report_generating = True # Set state to generating
                 st.session_state.report_generated = False  # Reset generated state
-                st.session_state.report_token_stats = {}     # Reset token stats
+                st.session_state.report_token_stats = {}     # Reset token stats 
 
                 # Display spinner while generating
                 with st.spinner("Generating report..."):
@@ -1182,8 +1406,8 @@ def main():
 
                         # Calculate and store token stats
                         token_data = {
-                            "system_prompt": st.session_state.report_sys_prompt,
-                            "user_prompt": st.session_state.report_user_prompt,
+                            "system_prompt": st.session_state.report_log_sys_prompt,
+                            "user_prompt": st.session_state.report_log_user_prompt,
                             "json_data": json_data_for_report,
                             "response": report_text
                         }
