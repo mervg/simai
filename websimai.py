@@ -15,6 +15,7 @@ import datetime
 import markdown2
 from xhtml2pdf import pisa
 import io
+import glob
 
 # Custom JSON encoder for handling pandas Timestamp objects
 class TimestampJSONEncoder(json.JSONEncoder):
@@ -28,7 +29,7 @@ class TimestampJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 SQLITE_DB_PATH = os.path.dirname(__file__)
-SQLITE_DB_FILENAME = os.path.join(SQLITE_DB_PATH, 'UDF.db')
+SQLITE_DB_FILENAME = os.path.join(SQLITE_DB_PATH, 'UDF.db')  # Keep as fallback
 
 # Pricing constants for Gemini models (per million tokens)
 GEMINI_PRICING = {
@@ -37,6 +38,17 @@ GEMINI_PRICING = {
     "gemini-1.5-flash": {"input_char": 0.00001875, "output_char": 0.000075},
     "gemini-1.5-pro": {"input_char": 0.0003125, "output_char": 0.00125}
 }
+
+def get_available_db_names():
+    """Find all .db files in the app's directory and return just their names."""
+    db_files = glob.glob(os.path.join(SQLITE_DB_PATH, "*.db"))
+    db_names = [os.path.basename(db_file) for db_file in db_files]
+    
+    if not db_names:
+        st.error("No database files found. Please run DM_tasks.py to generate UDF database files.")
+        st.stop()
+    
+    return db_names
 
 def st_init_page() -> bool:
     st.set_page_config(
@@ -109,7 +121,7 @@ def convert_date_format_agnostic(date_str):
         date_str: The date string to convert
         
     Returns:
-        str: The date in ISO format if conversion was successful, or the original string if not
+        pd.Timestamp or original value: The datetime object if conversion was successful, or the original string if not
     """
     if pd.isna(date_str):
         return date_str
@@ -124,15 +136,25 @@ def convert_date_format_agnostic(date_str):
     
     for fmt in formats_to_try:
         try:
-            # Convert to datetime and then to ISO format string
+            # Convert to datetime and return the datetime object directly
             dt = pd.to_datetime(date_str, format=fmt)
-            return dt.isoformat()
+            return dt  # Return the datetime object instead of dt.isoformat()
         except Exception:
             continue
             
     # If all conversions fail, keep the original value and log a warning
     print(f"Warning: Failed to convert date value '{date_str}' to datetime")
     return date_str
+
+def convert_df_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    print("convert_df_datetime > Converting datetime columns")
+    if 'udf_date' in df.columns and is_object_dtype(df['udf_date']):
+        df['udf_date'] = df['udf_date'].apply(convert_date_format_agnostic)
+        if is_datetime64_any_dtype(df['udf_date']):
+            df['udf_date'] = df['udf_date'].dt.tz_localize(None)
+        else:
+            print(f"udf_date column is not datetime dtype: {df['udf_date'].dtype}")
+    return df
 
 def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -151,15 +173,10 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
-    # Only convert the udf_date column to datetime using a format-agnostic approach 
-    if 'udf_date' in df.columns and is_object_dtype(df['udf_date']):
-        # Define a function to convert a single date value with multiple format attempts
-        # Apply the conversion function to the udf_date column
-        df['udf_date'] = df['udf_date'].apply(convert_date_format_agnostic)
-        
-        # Remove timezone information if present
-        if is_datetime64_any_dtype(df['udf_date']):
-            df['udf_date'] = df['udf_date'].dt.tz_localize(None)
+    if "filtered_df_converted" not in st.session_state:
+        df = convert_df_datetime(df)
+        st.session_state.filtered_df_converted = True
+
 
     modification_container = st.container()
 
@@ -444,6 +461,7 @@ def add_instances(toggle: bool) -> None:
         matching_instances = instances[
             instances['udf_entity_id'].str.startswith(task_id + '-')
         ]
+        # matching_instances['udf_date'] = matching_instances['udf_date'].apply(convert_date_format_agnostic)
         instances_to_add.append(matching_instances)
     
     if instances_to_add:
@@ -451,7 +469,7 @@ def add_instances(toggle: bool) -> None:
         all_instances = pd.concat(instances_to_add)
         st.session_state.selected_df = pd.concat(
             [st.session_state.selected_df, all_instances]
-        ).drop_duplicates()
+        ).drop_duplicates(subset='udf_entity_id', keep='first')
 
 def selection_changed():
     st.session_state.selected_in_json = {}
@@ -733,20 +751,23 @@ def reset_chat():
     st.session_state.file_tokens = 0
     st.session_state.total_tokens_out = 0
     st.session_state.total_tokens_in = 0
-    st.session_state.chat_token_stats = {
-        'total_tokens': 0,
-        'total_input_tokens': 0,
-        'total_output_tokens': 0,
-        'prompt_tokens': 0,
-        'json_tokens': 0,
-        'response_tokens': 0,
-        'using_native_counts': False,
-        'input_cost': 0.0,
-        'output_cost': 0.0,
-        'total_cost': 0.0
-    }
-    st.session_state.chat_generating = False
-    
+    st.session_state.chat_generating = False # Add chat_generating state
+        
+    # Ensure chat_token_stats is always initialized separately 
+    if "chat_token_stats" not in st.session_state:
+        st.session_state.chat_token_stats = {
+            'total_tokens': 0,
+            'total_input_tokens': 0,
+            'total_output_tokens': 0,
+            'prompt_tokens': 0,
+            'json_tokens': 0,
+            'response_tokens': 0,
+            'using_native_counts': False,
+            'input_cost': 0.0,
+            'output_cost': 0.0,
+            'total_cost': 0.0
+        }
+
     # Reinitialize the Gemini chat session
     if "gemini_chat_session" in st.session_state:
         # Get the existing model connection
@@ -993,10 +1014,45 @@ st_init_page() #called outside of main() to not  be run once and  not be incl ud
 
 def main():
     print("We are in main, RERUN")
-    # Load UDF data into DataFrame
+    
+    # Display the title
+    st.title("WebSIMAI - SalesIM AI Analysis Interface")
+    
+    # First, get the selected database
+    db_names = get_available_db_names()
+    selected_db_name = st.selectbox(
+        "Select UDF Database",
+        options=db_names,
+        index=None,
+        key="db_selector"
+    )
+    
+    # Stop here if no database is selected yet
+    if selected_db_name is None:
+        st.info("Please select a UDF database to continue.")
+        return
+    
+    # Get the full path for the selected database
+    selected_db_path = os.path.join(SQLITE_DB_PATH, selected_db_name)
+    
+    # Store the selected path in session state so we can check for changes
+    if 'current_db_path' not in st.session_state:
+        st.session_state.current_db_path = selected_db_path
+    
+    # If the database selection changed, update the state and rerun
+    if st.session_state.current_db_path != selected_db_path:
+        st.session_state.current_db_path = selected_db_path
+        # Clear the dataframe and related session state to force reload with new database 
+        for key in ["df", "df_total_recs", "filtered_df", "selected_df", "selected_rows"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
+    
+    # Load UDF data into DataFrame if not already loaded
     if "df" not in st.session_state:
-        st.spinner("Initializing: Loading UDF data...")        
-        st.session_state.df = load_udf_to_df(SQLITE_DB_FILENAME)
+        with st.spinner("Loading UDF data..."):
+            st.session_state.df = load_udf_to_df(selected_db_path)
+            st.session_state.df = convert_df_datetime(st.session_state.df)
         st.toast("UDF data loaded successfully")
 
     if "df_total_recs" not in st.session_state:
@@ -1017,7 +1073,7 @@ def main():
     st.write("Select rows in the dataset above to proceed...")
     # Filter based on selection
     if "selected_df" not in st.session_state:
-        st.session_state.selected_df = pd.DataFrame() #st.session_state.df.copy()
+        st.session_state.selected_df = pd.DataFrame() #st.session_state.df.copy() 
     else:
         selected_indices = st.session_state.selected_rows["selection"]["rows"]
         st.session_state.selected_df = st.session_state.filtered_df.iloc[selected_indices].copy()
