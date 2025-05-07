@@ -13,7 +13,7 @@ build/
 .streamlit/secrets.toml
 
 # Database files
-#*.db
+*.db
 
 # Log files
 logs/

@@ -419,8 +419,8 @@ def build_task_hierarchy(type_groups: Dict[str, List[Dict[str, Any]]]) -> Dict[s
 
 def generate_json_of_selected() -> Dict[str, Any]:
     print("Generating JSON...")
-    st.spinner("Generating JSON...")
-    st.session_state.selected_in_json = convert_selected_df_to_json(st.session_state.selected_df)
+    with st.spinner("Generating JSON..."):
+        st.session_state.selected_in_json = convert_selected_df_to_json(st.session_state.selected_df)
     st.toast("JSON generated successfully")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     json_filename = f"JSON_{timestamp}.json"
